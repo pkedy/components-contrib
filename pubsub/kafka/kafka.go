@@ -9,15 +9,15 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Shopify/sarama"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/pkg/errors"
+
+	"github.com/dapr/components-contrib/internal/retry"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/dapr/pkg/logger"
 )
@@ -28,79 +28,15 @@ const (
 
 // Kafka allows reading/writing to a Kafka consumer group
 type Kafka struct {
-	producer      sarama.SyncProducer
-	consumerGroup string
-	brokers       []string
-	logger        logger.Logger
-	authRequired  bool
-	saslUsername  string
-	saslPassword  string
-	cg            sarama.ConsumerGroup
-	topics        map[string]bool
-	cancel        context.CancelFunc
-	consumer      consumer
-	backOff       backoff.BackOff
-	config        *sarama.Config
-}
-
-type kafkaMetadata struct {
-	Brokers         []string `json:"brokers"`
-	ConsumerID      string   `json:"consumerID"`
-	AuthRequired    bool     `json:"authRequired"`
-	SaslUsername    string   `json:"saslUsername"`
-	SaslPassword    string   `json:"saslPassword"`
-	MaxMessageBytes int      `json:"maxMessageBytes"`
-}
-
-type consumer struct {
+	options  Options
+	producer sarama.SyncProducer
 	logger   logger.Logger
+	cg       sarama.ConsumerGroup
+	topics   map[string]bool
+	cancel   context.CancelFunc
+	consumer consumer
 	backOff  backoff.BackOff
-	ready    chan bool
-	callback func(msg *pubsub.NewMessage) error
-	once     sync.Once
-}
-
-func (consumer *consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	if consumer.callback == nil {
-		return fmt.Errorf("nil consumer callback")
-	}
-
-	bo := backoff.WithContext(consumer.backOff, session.Context())
-	for message := range claim.Messages() {
-		msg := pubsub.NewMessage{
-			Topic: message.Topic,
-			Data:  message.Value,
-		}
-		if err := pubsub.RetryNotifyRecover(func() error {
-			consumer.logger.Debugf("Processing Kafka message: %s/%d/%d [key=%s]", message.Topic, message.Partition, message.Offset, asBase64String(message.Key))
-			err := consumer.callback(&msg)
-			if err == nil {
-				session.MarkMessage(message, "")
-			}
-
-			return err
-		}, bo, func(err error, d time.Duration) {
-			consumer.logger.Errorf("Error processing Kafka message: %s/%d/%d [key=%s]. Retrying...", message.Topic, message.Partition, message.Offset, asBase64String(message.Key))
-		}, func() {
-			consumer.logger.Infof("Successfully processed Kafka message after it previously failed: %s/%d/%d [key=%s]", message.Topic, message.Partition, message.Offset, asBase64String(message.Key))
-		}); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (consumer *consumer) Cleanup(sarama.ConsumerGroupSession) error {
-	return nil
-}
-
-func (consumer *consumer) Setup(sarama.ConsumerGroupSession) error {
-	consumer.once.Do(func() {
-		close(consumer.ready)
-	})
-
-	return nil
+	config   *sarama.Config
 }
 
 // NewKafka returns a new kafka pubsub instance
@@ -110,38 +46,41 @@ func NewKafka(l logger.Logger) pubsub.PubSub {
 
 // Init does metadata parsing and connection establishment
 func (k *Kafka) Init(metadata pubsub.Metadata) error {
-	meta, err := k.getKafkaMetadata(metadata)
+	// Default options
+	k.options = Options{
+		BackOffConfig: retry.DefaultBackOffConfig,
+	}
+
+	// Decode options from metadata properties
+	if err := k.options.Decode(metadata.Properties); err != nil {
+		return errors.Errorf("kafka: configuration error: %v", err)
+	}
+
+	// Validate the decoded options
+	if err := k.options.Validate(); err != nil {
+		return err
+	}
+
+	k.logger.Debugf("Using %s as ConsumerGroup name", k.options.ConsumerID)
+	k.logger.Debugf("Found brokers: %v", k.options.Brokers)
+
+	p, err := k.getSyncProducer()
 	if err != nil {
 		return err
 	}
 
-	p, err := k.getSyncProducer(meta)
-	if err != nil {
-		return err
-	}
-
-	k.brokers = meta.Brokers
 	k.producer = p
-	k.consumerGroup = meta.ConsumerID
-
-	if meta.AuthRequired {
-		k.saslUsername = meta.SaslUsername
-		k.saslPassword = meta.SaslPassword
-	}
 
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_0_0_0
 
-	if k.authRequired {
-		updateAuthInfo(config, k.saslUsername, k.saslPassword)
+	if k.options.AuthRequired {
+		updateAuthInfo(config, k.options.SaslUsername, k.options.SaslPassword)
 	}
 
 	k.config = config
 
 	k.topics = make(map[string]bool)
-
-	// TODO: Make the backoff configurable for constant or exponential
-	k.backOff = backoff.NewConstantBackOff(5 * time.Second)
 
 	k.logger.Debug("Kafka message bus initialization complete")
 
@@ -206,7 +145,7 @@ func (k *Kafka) closeSubscripionResources() {
 // Subscribe to topic in the Kafka cluster
 // This call cannot block like its sibling in bindings/kafka because of where this is invoked in runtime.go
 func (k *Kafka) Subscribe(req pubsub.SubscribeRequest, handler func(msg *pubsub.NewMessage) error) error {
-	if k.consumerGroup == "" {
+	if k.options.ConsumerID == "" {
 		return errors.New("kafka: consumerID must be set to subscribe")
 	}
 
@@ -215,7 +154,7 @@ func (k *Kafka) Subscribe(req pubsub.SubscribeRequest, handler func(msg *pubsub.
 	// Close resources and reset synchronization primitives
 	k.closeSubscripionResources()
 
-	cg, err := sarama.NewConsumerGroup(k.brokers, k.consumerGroup, k.config)
+	cg, err := sarama.NewConsumerGroup(k.options.Brokers, k.options.ConsumerID, k.config)
 	if err != nil {
 		return err
 	}
@@ -227,8 +166,7 @@ func (k *Kafka) Subscribe(req pubsub.SubscribeRequest, handler func(msg *pubsub.
 
 	ready := make(chan bool)
 	k.consumer = consumer{
-		logger:   k.logger,
-		backOff:  k.backOff,
+		k:        k,
 		ready:    ready,
 		callback: handler,
 	}
@@ -267,76 +205,21 @@ func (k *Kafka) Subscribe(req pubsub.SubscribeRequest, handler func(msg *pubsub.
 	return nil
 }
 
-// getKafkaMetadata returns new Kafka metadata
-func (k *Kafka) getKafkaMetadata(metadata pubsub.Metadata) (*kafkaMetadata, error) {
-	meta := kafkaMetadata{}
-	// use the runtimeConfig.ID as the consumer group so that each dapr runtime creates its own consumergroup
-	meta.ConsumerID = metadata.Properties["consumerID"]
-	k.logger.Debugf("Using %s as ConsumerGroup name", meta.ConsumerID)
-
-	if val, ok := metadata.Properties["brokers"]; ok && val != "" {
-		meta.Brokers = strings.Split(val, ",")
-	} else {
-		return nil, errors.New("kafka error: missing 'brokers' attribute")
-	}
-
-	k.logger.Debugf("Found brokers: %v", meta.Brokers)
-
-	val, ok := metadata.Properties["authRequired"]
-	if !ok {
-		return nil, errors.New("kafka error: missing 'authRequired' attribute")
-	}
-	if val == "" {
-		return nil, errors.New("kafka error: 'authRequired' attribute was empty")
-	}
-	validAuthRequired, err := strconv.ParseBool(val)
-	if err != nil {
-		return nil, errors.New("kafka error: invalid value for 'authRequired' attribute")
-	}
-	meta.AuthRequired = validAuthRequired
-
-	// ignore SASL properties if authRequired is false
-	if meta.AuthRequired {
-		if val, ok := metadata.Properties["saslUsername"]; ok && val != "" {
-			meta.SaslUsername = val
-		} else {
-			return nil, errors.New("kafka error: missing SASL Username")
-		}
-
-		if val, ok := metadata.Properties["saslPassword"]; ok && val != "" {
-			meta.SaslPassword = val
-		} else {
-			return nil, errors.New("kafka error: missing SASL Password")
-		}
-	}
-
-	if val, ok := metadata.Properties["maxMessageBytes"]; ok && val != "" {
-		maxBytes, err := strconv.Atoi(val)
-		if err != nil {
-			return nil, fmt.Errorf("kafka error: cannot parse maxMessageBytes: %s", err)
-		}
-
-		meta.MaxMessageBytes = maxBytes
-	}
-
-	return &meta, nil
-}
-
-func (k *Kafka) getSyncProducer(meta *kafkaMetadata) (sarama.SyncProducer, error) {
+func (k *Kafka) getSyncProducer() (sarama.SyncProducer, error) {
 	config := sarama.NewConfig()
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Max = 5
 	config.Producer.Return.Successes = true
 
-	if k.authRequired {
-		updateAuthInfo(config, k.saslUsername, k.saslPassword)
+	if k.options.AuthRequired {
+		updateAuthInfo(config, k.options.SaslUsername, k.options.SaslPassword)
 	}
 
-	if meta.MaxMessageBytes > 0 {
-		config.Producer.MaxMessageBytes = meta.MaxMessageBytes
+	if k.options.MaxMessageBytes > 0 {
+		config.Producer.MaxMessageBytes = k.options.MaxMessageBytes
 	}
 
-	producer, err := sarama.NewSyncProducer(meta.Brokers, config)
+	producer, err := sarama.NewSyncProducer(k.options.Brokers, config)
 	if err != nil {
 		return nil, err
 	}
@@ -365,6 +248,56 @@ func (k *Kafka) Close() error {
 }
 
 func (k *Kafka) Features() []pubsub.Feature {
+	return nil
+}
+
+type consumer struct {
+	k        *Kafka
+	ready    chan bool
+	callback func(msg *pubsub.NewMessage) error
+	once     sync.Once
+}
+
+func (c *consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	if c.callback == nil {
+		return fmt.Errorf("nil consumer callback")
+	}
+
+	b := c.k.options.NewBackOffWithContext(session.Context())
+	for message := range claim.Messages() {
+		msg := pubsub.NewMessage{
+			Topic: message.Topic,
+			Data:  message.Value,
+		}
+		if err := retry.RetryNotifyRecover(func() error {
+			c.k.logger.Debugf("Processing Kafka message: %s/%d/%d [key=%s]", message.Topic, message.Partition, message.Offset, asBase64String(message.Key))
+			err := c.callback(&msg)
+			if err == nil {
+				session.MarkMessage(message, "")
+			}
+
+			return err
+		}, b, func(err error, d time.Duration) {
+			c.k.logger.Errorf("Error processing Kafka message: %s/%d/%d [key=%s]. Retrying...", message.Topic, message.Partition, message.Offset, asBase64String(message.Key))
+		}, func() {
+			c.k.logger.Infof("Successfully processed Kafka message after it previously failed: %s/%d/%d [key=%s]", message.Topic, message.Partition, message.Offset, asBase64String(message.Key))
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *consumer) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+func (c *consumer) Setup(sarama.ConsumerGroupSession) error {
+	c.once.Do(func() {
+		close(c.ready)
+	})
+
 	return nil
 }
 

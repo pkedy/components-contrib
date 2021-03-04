@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/apache/pulsar-client-go/pulsar"
-	"github.com/cenkalti/backoff/v4"
 
+	"github.com/dapr/components-contrib/internal/retry"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/dapr/pkg/logger"
 )
@@ -24,9 +24,9 @@ type Pulsar struct {
 	client   pulsar.Client
 	metadata pulsarMetadata
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	backOff backoff.BackOff
+	ctx           context.Context
+	cancel        context.CancelFunc
+	backOffConfig retry.BackOffConfig
 }
 
 func NewPulsar(l logger.Logger) pubsub.PubSub {
@@ -74,9 +74,11 @@ func (p *Pulsar) Init(metadata pubsub.Metadata) error {
 	p.client = client
 	p.metadata = *m
 
-	// TODO: Make the backoff configurable for constant or exponential
-	b := backoff.NewConstantBackOff(5 * time.Second)
-	p.backOff = backoff.WithContext(b, p.ctx)
+	backOffConfig, err := retry.DecodeConfig(metadata.Properties)
+	if err != nil {
+		return err
+	}
+	p.backOffConfig = backOffConfig
 
 	return nil
 }
@@ -149,7 +151,9 @@ func (p *Pulsar) handleMessage(msg pulsar.ConsumerMessage, handler func(msg *pub
 		Metadata: msg.Properties(),
 	}
 
-	return pubsub.RetryNotifyRecover(func() error {
+	b := p.backOffConfig.NewBackOffWithContext(p.ctx)
+
+	return retry.RetryNotifyRecover(func() error {
 		p.logger.Debugf("Processing Pulsar message %s/%#v", msg.Topic(), msg.ID())
 		err := handler(&pubsubMsg)
 		if err == nil {
@@ -157,7 +161,7 @@ func (p *Pulsar) handleMessage(msg pulsar.ConsumerMessage, handler func(msg *pub
 		}
 
 		return err
-	}, p.backOff, func(err error, d time.Duration) {
+	}, b, func(err error, d time.Duration) {
 		p.logger.Errorf("Error processing Pulsar message: %s/%#v [key=%s]. Retrying...", msg.Topic(), msg.ID(), msg.Key())
 	}, func() {
 		p.logger.Infof("Successfully processed Pulsar message after it previously failed: %s/%#v [key=%s]", msg.Topic(), msg.ID(), msg.Key())

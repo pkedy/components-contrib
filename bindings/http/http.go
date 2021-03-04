@@ -17,9 +17,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/mitchellh/mapstructure"
-
 	"github.com/dapr/components-contrib/bindings"
+	"github.com/dapr/components-contrib/internal/config"
 	"github.com/dapr/dapr/pkg/logger"
 )
 
@@ -43,7 +42,7 @@ func NewHTTP(logger logger.Logger) *HTTPSource {
 
 // Init performs metadata parsing
 func (h *HTTPSource) Init(metadata bindings.Metadata) error {
-	if err := mapstructure.Decode(metadata.Properties, &h.metadata); err != nil {
+	if err := config.Decode(metadata.Properties, &h.metadata); err != nil {
 		return err
 	}
 

@@ -15,9 +15,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
+	"github.com/dapr/components-contrib/internal/retry"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/dapr/pkg/logger"
 )
@@ -52,9 +52,9 @@ type mqttPubSub struct {
 	logger   logger.Logger
 	topics   map[string]byte
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	backOff backoff.BackOff
+	ctx           context.Context
+	cancel        context.CancelFunc
+	backOffConfig retry.BackOffConfig
 }
 
 // NewMQTTPubSub returns a new mqttPubSub instance.
@@ -160,9 +160,11 @@ func (m *mqttPubSub) Init(metadata pubsub.Metadata) error {
 
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
-	// TODO: Make the backoff configurable for constant or exponential
-	b := backoff.NewConstantBackOff(5 * time.Second)
-	m.backOff = backoff.WithContext(b, m.ctx)
+	backOffConfig, err := retry.DecodeConfig(metadata.Properties)
+	if err != nil {
+		return err
+	}
+	m.backOffConfig = backOffConfig
 
 	m.producer = p
 	m.topics = make(map[string]byte)
@@ -212,11 +214,8 @@ func (m *mqttPubSub) Subscribe(req pubsub.SubscribeRequest, handler func(msg *pu
 					Data:  mqttMsg.Payload(),
 				}
 
-				b := m.backOff
-				if m.metadata.backOffMaxRetries >= 0 {
-					b = backoff.WithMaxRetries(m.backOff, uint64(m.metadata.backOffMaxRetries))
-				}
-				if err := pubsub.RetryNotifyRecover(func() error {
+				b := m.backOffConfig.NewBackOffWithContext(m.ctx)
+				if err := retry.RetryNotifyRecover(func() error {
 					m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
 					if err := handler(&msg); err != nil {
 						return err

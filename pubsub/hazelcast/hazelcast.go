@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	"github.com/hazelcast/hazelcast-go-client"
 	hazelcastCore "github.com/hazelcast/hazelcast-go-client/core"
 
+	"github.com/dapr/components-contrib/internal/retry"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/dapr/pkg/logger"
 )
@@ -21,14 +20,18 @@ const (
 	hazelcastBackOffMaxRetries = "backOffMaxRetries"
 )
 
+type metadata struct {
+	hazelcastServers string
+}
+
 type Hazelcast struct {
 	client   hazelcast.Client
 	logger   logger.Logger
 	metadata metadata
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	backOff backoff.BackOff
+	ctx           context.Context
+	cancel        context.CancelFunc
+	backOffConfig retry.BackOffConfig
 }
 
 // NewHazelcastPubSub returns a new hazelcast pub-sub implementation
@@ -42,14 +45,6 @@ func parseHazelcastMetadata(meta pubsub.Metadata) (metadata, error) {
 		m.hazelcastServers = val
 	} else {
 		return m, errors.New("hazelcast error: missing hazelcast servers")
-	}
-
-	if val, ok := meta.Properties[hazelcastBackOffMaxRetries]; ok && val != "" {
-		backOffMaxRetriesInt, err := strconv.Atoi(val)
-		if err != nil {
-			return m, fmt.Errorf("hazelcast error: invalid backOffMaxRetries %s, %v", val, err)
-		}
-		m.backOffMaxRetries = backOffMaxRetriesInt
 	}
 
 	return m, nil
@@ -74,9 +69,11 @@ func (p *Hazelcast) Init(metadata pubsub.Metadata) error {
 
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// TODO: Make the backoff configurable for constant or exponential
-	b := backoff.NewConstantBackOff(5 * time.Second)
-	p.backOff = backoff.WithContext(b, p.ctx)
+	backOffConfig, err := retry.DecodeConfig(metadata.Properties)
+	if err != nil {
+		return err
+	}
+	p.backOffConfig = backOffConfig
 
 	return nil
 }
@@ -146,12 +143,9 @@ func (l *hazelcastMessageListener) handleMessageObject(message []byte) error {
 		Topic: l.topicName,
 	}
 
-	b := l.p.backOff
-	if l.p.metadata.backOffMaxRetries >= 0 {
-		b = backoff.WithMaxRetries(b, uint64(l.p.metadata.backOffMaxRetries))
-	}
+	b := l.p.backOffConfig.NewBackOffWithContext(l.p.ctx)
 
-	return pubsub.RetryNotifyRecover(func() error {
+	return retry.RetryNotifyRecover(func() error {
 		l.p.logger.Debug("Processing Hazelcast message")
 
 		return l.pubsubHandler(&pubsubMsg)

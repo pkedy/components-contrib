@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-redis/redis/v7"
 
+	"github.com/dapr/components-contrib/internal/retry"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/dapr/pkg/logger"
 )
@@ -44,8 +45,9 @@ type redisStreams struct {
 
 	queue chan redisMessageWrapper
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx           context.Context
+	cancel        context.CancelFunc
+	backOffConfig retry.BackOffConfig
 }
 
 // redisMessageWrapper encapsulates the message identifier,
@@ -161,6 +163,12 @@ func (r *redisStreams) Init(metadata pubsub.Metadata) error {
 
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 
+	backOffConfig, err := retry.DecodeConfig(metadata.Properties)
+	if err != nil {
+		return err
+	}
+	r.backOffConfig = backOffConfig
+
 	r.queue = make(chan redisMessageWrapper, int(r.metadata.queueDepth))
 	r.client = client
 
@@ -259,20 +267,26 @@ func (r *redisStreams) worker() {
 // Otherwise, it remains in the pending list and will be redelivered
 // by `reclaimPendingMessagesLoop`.
 func (r *redisStreams) processMessage(msg redisMessageWrapper) error {
-	r.logger.Debugf("Processing Redis message %s", msg.messageID)
-	if err := msg.handler(&msg.message); err != nil {
-		r.logger.Errorf("Error processing Redis message %s: %v", msg.messageID, err)
+	b := r.backOffConfig.NewBackOffWithContext(r.ctx)
 
-		return err
-	}
+	return retry.RetryNotifyRecover(func() error {
+		r.logger.Debugf("Processing Redis message %s", msg.messageID)
+		if err := msg.handler(&msg.message); err != nil {
+			return err
+		}
 
-	if err := r.client.XAck(msg.message.Topic, r.metadata.consumerID, msg.messageID).Err(); err != nil {
-		r.logger.Errorf("Error acknowledging Redis message %s: %v", msg.messageID, err)
+		if err := r.client.XAck(msg.message.Topic, r.metadata.consumerID, msg.messageID).Err(); err != nil {
+			r.logger.Errorf("Error acknowledging Redis message %s: %v", msg.messageID, err)
 
-		return err
-	}
+			return err
+		}
 
-	return nil
+		return nil
+	}, b, func(err error, d time.Duration) {
+		r.logger.Errorf("Error processing Redis message %s. Retrying...: %v", msg.messageID, err)
+	}, func() {
+		r.logger.Infof("Successfully processed Redis message after it previously failed: %s", msg.messageID)
+	})
 }
 
 // pollMessagesLoop calls `XReadGroup` for new messages and funnels them to the message channel
